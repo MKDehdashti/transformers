@@ -236,6 +236,52 @@ class Qwen2VLTextConfig(PreTrainedConfig):
         return kwargs
 
 
+class Qwen2VLAudioConfig(PreTrainedConfig):
+    """
+    Configuration for the audio branch of Qwen2-VL.
+
+    Stores the Whisper encoder hyper-parameters (defaults match
+    openai/whisper-large-v3-turbo, which uses 128 mel bins, 4 encoder layers,
+    and d_model=1280) plus the output dimension of the linear audio projector.
+
+    The model converts this to a ``WhisperConfig`` internally so that
+    ``WhisperEncoder`` can be instantiated without touching the network.
+    """
+
+    model_type = "qwen2_vl_audio"
+    base_config_key = "audio_config"
+
+    def __init__(
+        self,
+        num_mel_bins: int = 128,
+        d_model: int = 1280,
+        encoder_layers: int = 32,
+        encoder_attention_heads: int = 20,
+        encoder_ffn_dim: int = 5120,
+        encoder_layerdrop: float = 0.0,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        activation_function: str = "gelu",
+        max_source_positions: int = 1500,
+        scale_embedding: bool = False,
+        pad_token_id: int = 50256,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_mel_bins = num_mel_bins
+        self.d_model = d_model
+        self.encoder_layers = encoder_layers
+        self.encoder_attention_heads = encoder_attention_heads
+        self.encoder_ffn_dim = encoder_ffn_dim
+        self.encoder_layerdrop = encoder_layerdrop
+        self.dropout = dropout
+        self.attention_dropout = attention_dropout
+        self.activation_function = activation_function
+        self.max_source_positions = max_source_positions
+        self.scale_embedding = scale_embedding
+        self.pad_token_id = pad_token_id
+
+
 class Qwen2VLConfig(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2VLModel`]. It is used to instantiate a
@@ -275,23 +321,36 @@ class Qwen2VLConfig(PreTrainedConfig):
     ```"""
 
     model_type = "qwen2_vl"
-    sub_configs = {"vision_config": Qwen2VLVisionConfig, "text_config": Qwen2VLTextConfig}
+    sub_configs = {
+        "vision_config": Qwen2VLVisionConfig,
+        "text_config": Qwen2VLTextConfig,
+        "audio_config": Qwen2VLAudioConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
         text_config=None,
         vision_config=None,
+        audio_config=None,
         image_token_id=151655,
         video_token_id=151656,
         vision_start_token_id=151652,
         vision_end_token_id=151653,
+        audio_token_id=151658,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+
+        if isinstance(audio_config, dict):
+            self.audio_config = self.sub_configs["audio_config"](**audio_config)
+        elif audio_config is None:
+            self.audio_config = self.sub_configs["audio_config"]()
+        else:
+            self.audio_config = audio_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
@@ -302,15 +361,18 @@ class Qwen2VLConfig(PreTrainedConfig):
             text_config = {key: kwargs.pop(key) for key in text_params if key in kwargs}
             text_config["dtype"] = kwargs.get("torch_dtype", kwargs.get("dtype"))  # don't pop the dtype
             self.text_config = self.sub_configs["text_config"](**text_config)
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
+        self.audio_token_id = audio_token_id
 
         # FIXME: arthur/cyril - tying has to be used from the text config
         kwargs["tie_word_embeddings"] = self.text_config.tie_word_embeddings
         super().__init__(**kwargs)
 
 
-__all__ = ["Qwen2VLConfig", "Qwen2VLTextConfig"]
+__all__ = ["Qwen2VLAudioConfig", "Qwen2VLConfig", "Qwen2VLTextConfig"]

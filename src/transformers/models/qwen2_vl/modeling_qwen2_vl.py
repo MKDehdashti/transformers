@@ -47,7 +47,8 @@ from ...utils import (
 from ..qwen2.modeling_qwen2 import (
     Qwen2RMSNorm,
 )
-from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
+from ..whisper.modeling_whisper import WhisperEncoder
+from .configuration_qwen2_vl import Qwen2VLAudioConfig, Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
 logger = logging.get_logger(__name__)
@@ -1607,4 +1608,256 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         return input_ids, model_kwargs
 
 
-__all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
+class Qwen2VLAudioForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
+    """
+    Qwen2-VL extended with a Whisper audio encoder and a linear projector.
+
+    Audio pipeline:
+        input_features [B, num_mel_bins, T] → WhisperEncoder → [B, T_enc, d_model]
+            → audio_projector → [B, T_enc, llm_hidden]
+            → scatter into inputs_embeds at <|audio_pad|> positions
+
+    All original vision-language capabilities are preserved unchanged.
+    """
+
+    _checkpoint_conversion_mapping = {
+        "^visual": "model.visual",
+        r"^model(?!\.(language_model|visual))": "model.language_model",
+    }
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    def __init__(self, config: Qwen2VLConfig):
+        super().__init__(config)
+        self.model = Qwen2VLModel(config)
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+
+        # Build a WhisperConfig from our audio sub-config so we can instantiate
+        # WhisperEncoder without touching the network.
+        from transformers import WhisperConfig as _WhisperConfig
+
+        whisper_cfg = _WhisperConfig(
+            num_mel_bins=config.audio_config.num_mel_bins,
+            d_model=config.audio_config.d_model,
+            encoder_layers=config.audio_config.encoder_layers,
+            encoder_attention_heads=config.audio_config.encoder_attention_heads,
+            encoder_ffn_dim=config.audio_config.encoder_ffn_dim,
+            encoder_layerdrop=config.audio_config.encoder_layerdrop,
+            dropout=config.audio_config.dropout,
+            attention_dropout=config.audio_config.attention_dropout,
+            activation_function=config.audio_config.activation_function,
+            max_source_positions=config.audio_config.max_source_positions,
+            scale_embedding=config.audio_config.scale_embedding,
+            pad_token_id=config.audio_config.pad_token_id,
+        )
+        self.audio_encoder = WhisperEncoder(whisper_cfg)
+        self.audio_projector = nn.Linear(
+            config.audio_config.d_model,
+            config.text_config.hidden_size,
+            bias=True,
+        )
+
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+
+    def get_audio_features(
+        self,
+        input_features: torch.FloatTensor,
+        audio_lengths: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        """
+        Encode a batch of log-mel spectrograms and project to LLM space.
+
+        Args:
+            input_features: ``[B, num_mel_bins, T_max]`` — padded batch from
+                ``Qwen2VLAudioProcessor``.
+            audio_lengths: ``[B]`` int64 — actual number of encoder output
+                tokens per audio (un-padded), as computed by the processor.
+
+        Returns:
+            ``[sum(audio_lengths), llm_hidden_size]`` float tensor ready to be
+            scattered into ``inputs_embeds`` at ``<|audio_pad|>`` positions.
+        """
+        # WhisperEncoder requires exactly max_source_positions * conv_strides frames.
+        # The audio processor uses padding=False, so we right-pad here.
+        expected_len = self.config.audio_config.max_source_positions * 2  # conv1 stride 1 * conv2 stride 2
+        if input_features.shape[-1] < expected_len:
+            input_features = F.pad(input_features, (0, expected_len - input_features.shape[-1]))
+
+        # [B, T_enc, d_model]
+        encoder_out = self.audio_encoder(input_features).last_hidden_state
+        # [B, T_enc, llm_hidden]
+        projected = self.audio_projector(encoder_out)
+        # Trim padding and flatten into a single sequence
+        audio_embeds = torch.cat(
+            [projected[i, : audio_lengths[i], :] for i in range(len(audio_lengths))],
+            dim=0,
+        )  # [sum(audio_lengths), llm_hidden]
+        return audio_embeds
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
+        audio_lengths: Optional[torch.LongTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Union[tuple, Qwen2VLCausalLMOutputWithPast]:
+        r"""
+        input_features (`torch.FloatTensor` of shape `(batch_size, num_mel_bins, T)`, *optional*):
+            Log-mel spectrogram batch from ``Qwen2VLAudioProcessor``.
+        audio_lengths (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Number of ``<|audio_pad|>`` tokens for each audio in the batch.
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # --- Embed tokens and inject audio embeddings before passing to model ---
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if input_features is not None and audio_lengths is not None:
+            audio_embeds = self.get_audio_features(
+                input_features.to(inputs_embeds.dtype),
+                audio_lengths,
+            )
+            audio_mask = (input_ids == self.config.audio_token_id)
+            audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
+
+        # --- Delegate to Qwen2VLModel (handles vision injection + RoPE + LM) ---
+        outputs: Qwen2VLModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+
+        return Qwen2VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        input_features=None,
+        audio_lengths=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        # Vision rope logic — mirrors Qwen2VLForConditionalGeneration exactly.
+        # Cannot call that method unbound because its super() requires self to be
+        # an instance of Qwen2VLForConditionalGeneration (MRO constraint).
+        if position_ids is None:
+            if model_inputs["cache_position"][0] == 0 or self.model.rope_deltas is None:
+                vision_positions, rope_deltas = self.model.get_rope_index(
+                    model_inputs.get("input_ids", None),
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )
+                self.model.rope_deltas = rope_deltas
+            elif "position_ids" in model_inputs:
+                batch_size, seq_length = model_inputs["position_ids"].shape
+                device = model_inputs["position_ids"].device
+                position_ids = torch.arange(seq_length, device=device)
+                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
+                delta = cache_position[0] + self.model.rope_deltas
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                vision_positions = position_ids + delta.expand_as(position_ids)
+
+            text_positions = model_inputs["position_ids"][None, ...]
+            model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
+
+        if model_inputs["cache_position"][0] != 0:
+            model_inputs["pixel_values"] = None
+            model_inputs["pixel_values_videos"] = None
+
+        # Only pass audio on the first (pre-fill) step
+        if cache_position is not None and cache_position[0] == 0:
+            model_inputs["input_features"] = input_features
+            model_inputs["audio_lengths"] = audio_lengths
+        return model_inputs
+
+
+__all__ = [
+    "Qwen2VLAudioForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2VLModel",
+    "Qwen2VLPreTrainedModel",
+    "Qwen2VLTextModel",
+]
