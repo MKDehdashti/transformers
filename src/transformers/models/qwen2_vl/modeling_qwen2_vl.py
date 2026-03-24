@@ -1854,8 +1854,186 @@ class Qwen2VLAudioForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMix
         return model_inputs
 
 
+class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGeneration):
+    """
+    Dual-encoder audio-visual model for MUSIC-AVQA.
+
+    Two audio paths on top of Qwen2-VL:
+
+    1. Whisper encoder  (inherited)  — TTS'd text questions
+         input_features [B, 128, T] → WhisperEncoder → audio_projector
+         → scatter at <|audio_pad|> positions (variable length per clip)
+
+    2. PANNs CNN14  (new)  — video music/audio track
+         music_features [B, panns_dim] → music_projector
+         → [B * n_music_tokens, llm_hidden]
+         → scatter at <|music_pad|> positions (fixed n_music_tokens per sample)
+
+    music_features are precomputed PANNs CNN14 embeddings (shape [B, panns_dim]).
+    PANNs is NOT stored in this model; run src/avqa/panns_preprocess.py once to
+    produce per-video .npy caches, then pass loaded tensors as music_features.
+    """
+
+    def __init__(self, config: Qwen2VLConfig):
+        super().__init__(config)
+        # Project PANNs global embedding → n_music_tokens LLM-space vectors
+        self.music_projector = nn.Linear(
+            config.panns_dim,
+            config.n_music_tokens * config.text_config.hidden_size,
+            bias=True,
+        )
+        self.post_init()
+
+    def get_music_features(self, music_features: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Args:
+            music_features: ``[B, panns_dim]``
+        Returns:
+            ``[B * n_music_tokens, llm_hidden]`` ready to scatter at <|music_pad|>.
+        """
+        B = music_features.shape[0]
+        projected = self.music_projector(music_features)          # (B, n * h)
+        return projected.view(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
+        audio_lengths: Optional[torch.LongTensor] = None,
+        music_features: Optional[torch.FloatTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Union[tuple, Qwen2VLCausalLMOutputWithPast]:
+        r"""
+        input_features (`torch.FloatTensor` of shape `(batch_size, num_mel_bins, T)`, *optional*):
+            Log-mel spectrogram batch (TTS'd questions) from ``Qwen2VLAudioProcessor``.
+        audio_lengths (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Number of ``<|audio_pad|>`` tokens per question clip.
+        music_features (`torch.FloatTensor` of shape `(batch_size, panns_dim)`, *optional*):
+            Precomputed PANNs CNN14 embeddings for the video audio track.
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for the masked language modelling loss.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        # Inject Whisper speech features (TTS'd questions) ----------------
+        if input_features is not None and audio_lengths is not None:
+            audio_embeds = self.get_audio_features(
+                input_features.to(inputs_embeds.dtype), audio_lengths
+            )
+            audio_mask = (input_ids == self.config.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
+
+        # Inject PANNs music features (video audio track) -----------------
+        if music_features is not None:
+            music_embeds = self.get_music_features(music_features.to(inputs_embeds.dtype))
+            music_mask = (input_ids == self.config.music_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(music_mask, music_embeds)
+
+        # Delegate to Qwen2VLModel (vision injection + RoPE + LM) ---------
+        outputs: Qwen2VLModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+
+        return Qwen2VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        input_features=None,
+        audio_lengths=None,
+        music_features=None,
+        **kwargs,
+    ):
+        # Parent handles vision rope, pixel stripping, audio pass-through
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            input_features=input_features,
+            audio_lengths=audio_lengths,
+            **kwargs,
+        )
+        # Pass music_features only on the first (pre-fill) step
+        if cache_position is not None and cache_position[0] == 0:
+            model_inputs["music_features"] = music_features
+        return model_inputs
+
+
 __all__ = [
     "Qwen2VLAudioForConditionalGeneration",
+    "Qwen2VLDualAudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2VLModel",
     "Qwen2VLPreTrainedModel",

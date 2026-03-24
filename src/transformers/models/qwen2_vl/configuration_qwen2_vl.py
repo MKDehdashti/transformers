@@ -338,6 +338,9 @@ class Qwen2VLConfig(PreTrainedConfig):
         vision_start_token_id=151652,
         vision_end_token_id=151653,
         audio_token_id=151658,
+        music_token_id=151661,
+        n_music_tokens=8,
+        panns_dim=2048,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -369,6 +372,9 @@ class Qwen2VLConfig(PreTrainedConfig):
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
         self.audio_token_id = audio_token_id
+        self.music_token_id = music_token_id
+        self.n_music_tokens = n_music_tokens
+        self.panns_dim = panns_dim
 
         # FIXME: arthur/cyril - tying has to be used from the text config
         kwargs["tie_word_embeddings"] = self.text_config.tie_word_embeddings
