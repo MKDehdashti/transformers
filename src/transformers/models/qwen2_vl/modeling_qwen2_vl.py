@@ -1864,21 +1864,21 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
          input_features [B, 128, T] → WhisperEncoder → audio_projector
          → scatter at <|audio_pad|> positions (variable length per clip)
 
-    2. PANNs CNN14  (new)  — video music/audio track
-         music_features [B, panns_dim] → music_projector
+    2. CLAP  (new)  — video music/audio track
+         music_features [B, music_embed_dim] → music_projector
          → [B * n_music_tokens, llm_hidden]
          → scatter at <|music_pad|> positions (fixed n_music_tokens per sample)
 
-    music_features are precomputed PANNs CNN14 embeddings (shape [B, panns_dim]).
-    PANNs is NOT stored in this model; run src/avqa/panns_preprocess.py once to
+    music_features are precomputed CLAP embeddings (shape [B, music_embed_dim]).
+    CLAP is NOT stored in this model; run src/avqa/clap_preprocess.py once to
     produce per-video .npy caches, then pass loaded tensors as music_features.
     """
 
     def __init__(self, config: Qwen2VLConfig):
         super().__init__(config)
-        # Project PANNs global embedding → n_music_tokens LLM-space vectors
+        # Project CLAP embedding → n_music_tokens LLM-space vectors
         self.music_projector = nn.Linear(
-            config.panns_dim,
+            config.music_embed_dim,
             config.n_music_tokens * config.text_config.hidden_size,
             bias=True,
         )
@@ -1887,7 +1887,7 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
     def get_music_features(self, music_features: torch.FloatTensor) -> torch.FloatTensor:
         """
         Args:
-            music_features: ``[B, panns_dim]``
+            music_features: ``[B, music_embed_dim]``
         Returns:
             ``[B * n_music_tokens, llm_hidden]`` ready to scatter at <|music_pad|>.
         """
