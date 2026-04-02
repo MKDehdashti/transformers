@@ -340,7 +340,7 @@ class Qwen2VLConfig(PreTrainedConfig):
         audio_token_id=151658,
         music_token_id=151661,
         n_music_tokens=8,
-        music_embed_dim=512,
+        music_embed_dim=768,    # BEATs default; CLAP=512, PANNs=2048 (use panns_dim for legacy)
         panns_dim=None,         # legacy — superseded by music_embed_dim
         **kwargs,
     ):
