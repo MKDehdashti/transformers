@@ -340,7 +340,8 @@ class Qwen2VLConfig(PreTrainedConfig):
         audio_token_id=151658,
         music_token_id=151661,
         n_music_tokens=8,
-        music_embed_dim=768,    # BEATs default; CLAP=512, PANNs=2048 (use panns_dim for legacy)
+        music_embed_dim=768,    # MERT=768, Whisper=1280, CLAP=512, PANNs=2048 (use panns_dim for legacy)
+        music_seq_input=False,  # False=single-vector (PANNs/CLAP/MERT), True=sequence (Whisper 32-frame)
         panns_dim=None,         # legacy — superseded by music_embed_dim
         **kwargs,
     ):
@@ -375,6 +376,7 @@ class Qwen2VLConfig(PreTrainedConfig):
         self.audio_token_id = audio_token_id
         self.music_token_id = music_token_id
         self.n_music_tokens = n_music_tokens
+        self.music_seq_input = music_seq_input
         # Accept legacy panns_dim from old config.json files; prefer music_embed_dim
         self.music_embed_dim = panns_dim if panns_dim is not None else music_embed_dim
 

@@ -1876,24 +1876,39 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
 
     def __init__(self, config: Qwen2VLConfig):
         super().__init__(config)
-        # Project CLAP embedding → n_music_tokens LLM-space vectors
-        self.music_projector = nn.Linear(
-            config.music_embed_dim,
-            config.n_music_tokens * config.text_config.hidden_size,
-            bias=True,
-        )
+        # music_seq_input=False (PANNs/CLAP/MERT): single vector [B, D] → Linear(D, n*H) → n tokens
+        # music_seq_input=True  (Whisper-32):       sequence [B, T, D] → Linear(D, H) per-frame → T tokens
+        if config.music_seq_input:
+            self.music_projector = nn.Linear(
+                config.music_embed_dim,
+                config.text_config.hidden_size,
+                bias=True,
+            )
+        else:
+            self.music_projector = nn.Linear(
+                config.music_embed_dim,
+                config.n_music_tokens * config.text_config.hidden_size,
+                bias=True,
+            )
         self.post_init()
 
     def get_music_features(self, music_features: torch.FloatTensor) -> torch.FloatTensor:
         """
         Args:
-            music_features: ``[B, music_embed_dim]``
+            music_features: ``[B, music_embed_dim]``          (music_seq_input=False, PANNs/CLAP/MERT)
+                         or ``[B, n_music_tokens, music_embed_dim]`` (music_seq_input=True, Whisper-32)
         Returns:
             ``[B * n_music_tokens, llm_hidden]`` ready to scatter at <|music_pad|>.
         """
         B = music_features.shape[0]
-        projected = self.music_projector(music_features)          # (B, n * h)
-        return projected.view(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
+        if self.config.music_seq_input:
+            # Sequence input: [B, T, D] → per-frame projection → [B, T, H] → [B*T, H]
+            projected = self.music_projector(music_features)      # (B, T, H)
+            return projected.reshape(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
+        else:
+            # Single-vector input: [B, D] → [B, n*H] → [B*n, H]
+            projected = self.music_projector(music_features)      # (B, n * H)
+            return projected.view(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
 
     @can_return_tuple
     @auto_docstring
@@ -1925,8 +1940,9 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
             Log-mel spectrogram batch (TTS'd questions) from ``Qwen2VLAudioProcessor``.
         audio_lengths (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Number of ``<|audio_pad|>`` tokens per question clip.
-        music_features (`torch.FloatTensor` of shape `(batch_size, panns_dim)`, *optional*):
-            Precomputed PANNs CNN14 embeddings for the video audio track.
+        music_features (`torch.FloatTensor` of shape `(batch_size, music_embed_dim)` or `(batch_size, n_music_tokens, music_embed_dim)`, *optional*):
+            Precomputed music encoder embeddings for the video audio track.
+            Shape depends on config.music_seq_input: False=single vector, True=sequence (Whisper-32).
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for the masked language modelling loss.
         """
