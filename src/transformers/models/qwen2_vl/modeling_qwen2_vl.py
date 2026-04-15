@@ -1895,18 +1895,26 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
     def get_music_features(self, music_features: torch.FloatTensor) -> torch.FloatTensor:
         """
         Args:
-            music_features: ``[B, music_embed_dim]``          (music_seq_input=False, PANNs/CLAP/MERT)
-                         or ``[B, n_music_tokens, music_embed_dim]`` (music_seq_input=True, Whisper-32)
+            music_features: ``[B, music_embed_dim]``               (music_seq_input=False, PANNs/CLAP/MERT)
+                         or ``[B, T, music_embed_dim]``             (music_seq_input=True, legacy fixed-T, e.g. Whisper-32)
+                         or ``[total_T, music_embed_dim]``          (music_seq_input=True, variable n_music_tokens,
+                                                                      all samples concatenated; total_T = sum(music_lengths))
         Returns:
-            ``[B * n_music_tokens, llm_hidden]`` ready to scatter at <|music_pad|>.
+            ``[total_T, llm_hidden]`` ready to scatter at <|music_pad|> positions.
         """
-        B = music_features.shape[0]
         if self.config.music_seq_input:
-            # Sequence input: [B, T, D] → per-frame projection → [B, T, H] → [B*T, H]
-            projected = self.music_projector(music_features)      # (B, T, H)
-            return projected.reshape(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
+            # Accept both [B, T, D] (legacy fixed-T) and flat [total_T, D] (variable-T).
+            # In both cases we just project each frame independently.
+            if music_features.dim() == 3:
+                # Legacy stacked form [B, T, D] → flatten to [B*T, D] first
+                B, T, D = music_features.shape
+                music_features = music_features.reshape(B * T, D)
+            # music_features is now [total_T, D]
+            projected = self.music_projector(music_features)  # [total_T, H]
+            return projected
         else:
             # Single-vector input: [B, D] → [B, n*H] → [B*n, H]
+            B = music_features.shape[0]
             projected = self.music_projector(music_features)      # (B, n * H)
             return projected.view(B * self.config.n_music_tokens, self.config.text_config.hidden_size)
 

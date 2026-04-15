@@ -99,6 +99,7 @@ class Qwen2VLProcessor(ProcessorMixin):
         videos: Optional[VideoInput] = None,
         audios=None,
         music_features=None,
+        music_lengths=None,
         **kwargs: Unpack[Qwen2VLProcessorKwargs],
     ) -> BatchFeature:
         """
@@ -201,12 +202,16 @@ class Qwen2VLProcessor(ProcessorMixin):
                     index += 1
                 text[i] = text[i].replace("<|placeholder|>", self.audio_token)
 
-        # Expand each single <|music_pad|> to n_music_tokens copies (fixed per clip)
+        # Expand each single <|music_pad|> to n_music_tokens copies.
+        # music_lengths (list[int], optional): per-sample token counts for variable-length
+        # sequence encoders (e.g. Whisper-fullres where 60s → 64 tokens, 30s → 32 tokens).
+        # Falls back to self.n_music_tokens (config value) when not provided.
         if music_features is not None:
             import torch as _torch
             for i in range(len(text)):
+                n_tok = music_lengths[i] if music_lengths is not None else self.n_music_tokens
                 while self.music_token in text[i]:
-                    text[i] = text[i].replace(self.music_token, "<|mplaceholder|>" * self.n_music_tokens, 1)
+                    text[i] = text[i].replace(self.music_token, "<|mplaceholder|>" * n_tok, 1)
                 text[i] = text[i].replace("<|mplaceholder|>", self.music_token)
             # Pass music_features through as-is; model will project them
             if isinstance(music_features, _torch.Tensor):
