@@ -226,9 +226,10 @@ class Qwen2VLAudioProcessor(SequenceFeatureExtractor):
             sr_default = sr if sr is not None else self.sampling_rate
             array, orig_sr = fetch_audio(audio, sampling_rate=sr_default)
             array = self._resample(array, orig_sr)
-            # Token count from resampled length BEFORE feature extraction.
-            audio_lengths.append(_num_audio_tokens(len(array), self.hop_length, self.n_fft))
-            log_mels.append(self._compute_log_mel(array))  # [n_mels, T_i]
+            log_mel = self._compute_log_mel(array)  # [n_mels, T_i]
+            # Derive token count from actual mel frames so it matches encoder output exactly.
+            audio_lengths.append(log_mel.shape[-1] // 2)
+            log_mels.append(log_mel)
 
         # Pad all log-mels to T_max along the time axis.
         t_max = max(lm.shape[-1] for lm in log_mels)

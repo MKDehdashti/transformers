@@ -633,9 +633,9 @@ class WhisperEncoder(WhisperPreTrainedModel):
         """
 
         expected_seq_length = self.config.max_source_positions * self.conv1.stride[0] * self.conv2.stride[0]
-        if input_features.shape[-1] != expected_seq_length:
+        if input_features.shape[-1] > expected_seq_length:
             raise ValueError(
-                f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
+                f"Whisper expects the mel input features to be at most {expected_seq_length} frames, but found {input_features.shape[-1]}. Make sure to pad the input mel features to at most {expected_seq_length}."
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -647,7 +647,7 @@ class WhisperEncoder(WhisperPreTrainedModel):
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
-        all_positions = torch.arange(self.embed_positions.num_embeddings, device=inputs_embeds.device)
+        all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
         hidden_states = inputs_embeds + self.embed_positions(all_positions)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)

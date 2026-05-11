@@ -1682,12 +1682,6 @@ class Qwen2VLAudioForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMix
             ``[sum(audio_lengths), llm_hidden_size]`` float tensor ready to be
             scattered into ``inputs_embeds`` at ``<|audio_pad|>`` positions.
         """
-        # WhisperEncoder requires exactly max_source_positions * conv_strides frames.
-        # The audio processor uses padding=False, so we right-pad here.
-        expected_len = self.config.audio_config.max_source_positions * 2  # conv1 stride 1 * conv2 stride 2
-        if input_features.shape[-1] < expected_len:
-            input_features = F.pad(input_features, (0, expected_len - input_features.shape[-1]))
-
         # [B, T_enc, d_model]
         encoder_out = self.audio_encoder(input_features).last_hidden_state
         # [B, T_enc, llm_hidden]
@@ -1864,19 +1858,20 @@ class Qwen2VLDualAudioForConditionalGeneration(Qwen2VLAudioForConditionalGenerat
          input_features [B, 128, T] → WhisperEncoder → audio_projector
          → scatter at <|audio_pad|> positions (variable length per clip)
 
-    2. CLAP  (new)  — video music/audio track
+    2. Music encoder  (offline)  — video music/audio track
          music_features [B, music_embed_dim] → music_projector
-         → [B * n_music_tokens, llm_hidden]
-         → scatter at <|music_pad|> positions (fixed n_music_tokens per sample)
+         → [B * n_music_tokens, llm_hidden]  (music_seq_input=False, e.g. PANNs)
+         → [total_T, llm_hidden]             (music_seq_input=True,  e.g. Whisper-32)
+         → scatter at <|music_pad|> positions
 
-    music_features are precomputed CLAP embeddings (shape [B, music_embed_dim]).
-    CLAP is NOT stored in this model; run src/avqa/clap_preprocess.py once to
-    produce per-video .npy caches, then pass loaded tensors as music_features.
+    music_features are precomputed offline embeddings — the music encoder is NOT
+    stored in this model.  Run the appropriate src/avqa/*_preprocess.py script
+    once to produce per-video .npy caches, then pass loaded tensors as music_features.
     """
 
     def __init__(self, config: Qwen2VLConfig):
         super().__init__(config)
-        # music_seq_input=False (PANNs/CLAP/MERT): single vector [B, D] → Linear(D, n*H) → n tokens
+        # music_seq_input=False (PANNs): single vector [B, D] → Linear(D, n*H) → n tokens
         # music_seq_input=True  (Whisper-32):       sequence [B, T, D] → Linear(D, H) per-frame → T tokens
         if config.music_seq_input:
             self.music_projector = nn.Linear(
